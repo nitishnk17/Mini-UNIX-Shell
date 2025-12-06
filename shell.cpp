@@ -5,6 +5,7 @@
 #include<cstring>
 #include<unistd.h>
 #include<sys/wait.h>
+#include<cerrno>
 
 using namespace std;
 
@@ -22,8 +23,8 @@ vector<string>parseLine(const string& line){
 int main(){
     string inputLine;
 
-    while(1){
-        cout<<" Mini-shell> ";
+    while(true){
+        cout<<"Mini-shell> ";
 
         if(!getline(cin,inputLine)){ //read input
             cout<<"\n";
@@ -37,6 +38,17 @@ int main(){
         if(args.empty()) continue;
 
         if(args[0]== "exit") break;
+
+        if(args[0]=="cd"){
+            if(args.size()<2){
+                cerr<<"cs: missing arguments\n";
+            }else{
+                if(chdir(args[1].c_str()) !=0){
+                    cerr<<"cd: "<< strerror(errno)<<"\n";
+                }
+            }
+            continue;
+        }
 
         vector<char*> c_args;
         for(auto& arg:args){
