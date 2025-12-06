@@ -7,8 +7,6 @@
 #include<sys/wait.h>
 #include<cerrno>
 
-
-// asdfsd
 using namespace std;
 
 vector<string>parseLine(const string& line){
