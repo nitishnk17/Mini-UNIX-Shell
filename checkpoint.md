@@ -1,11 +1,9 @@
-Stage 1: Basic Loop. Get the prompt to appear and parse simple commands (e.g., ls -l). Implement exit.
+Step1. Execute external programs using PATH lookup
 
-Stage 2: Execution. Implement fork, execvp, and wait.
+Step2. Argument parsing including quoted strings
 
-Stage 3: Built-ins. Implement cd.
+Step3. I/O redirection (<, >)
 
-Stage 4: Redirection. Add logic for > and <.
+Step4. Single pipeline support (cmd1 | cmd2)
 
-Stage 5: Pipelining. Implement the logic for |.
-
-Stage 6: Signals & Background. Add & support and Ctrl-C handling.
+Step5. Background execution (&)
