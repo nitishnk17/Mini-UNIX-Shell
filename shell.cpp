@@ -9,7 +9,7 @@
 #include <cerrno>   
 #include <cstdlib>   
 
-// Parseing input line & handle quoted strings
+// Parsing input line & handle quoted strings
 std::vector<std::string> parseLine(const std::string& line) {
     std::vector<std::string> args;
     std::string currentWord = "";
