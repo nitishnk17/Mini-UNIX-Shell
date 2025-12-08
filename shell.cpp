@@ -8,11 +8,46 @@
 #include <fcntl.h>
 #include <cerrno>
 #include <cstdlib>
+#include <cctype>
+
+extern char **environ; // for env builtin
 
 // Function declaration
 std::vector<std::string> parseLine(const std::string& line);
-void executeSingleCommand(std::vector<std::string>& cleanArgs,const std::string& inputFile,const std::string& outputFile);
-void executePipeline(std::vector<std::string>& leftArgs,std::vector<std::string>& rightArgs,const std::string& inputFile,const std::string& outputFile);
+void executeSingleCommand(std::vector<std::string>& cleanArgs,
+                          const std::string& inputFile,
+                          const std::string& outputFile);
+void executePipeline(std::vector<std::string>& leftArgs,
+                     std::vector<std::string>& rightArgs,
+                     const std::string& inputFile,
+                     const std::string& outputFile);
+
+// --- NEW: expand $VAR in arguments ---
+void expandEnvironment(std::vector<std::string>& args) {
+    for (auto &arg : args) {
+        std::string result;
+        for (size_t i = 0; i < arg.size();) {
+            if (arg[i] == '$') {
+                size_t j = i + 1;
+                while (j < arg.size() &&
+                       (std::isalnum(static_cast<unsigned char>(arg[j])) ||
+                        arg[j] == '_')) {
+                    j++;
+                }
+                std::string varName = arg.substr(i + 1, j - (i + 1));
+                const char* val = getenv(varName.c_str());
+                if (val) {
+                    result += val;
+                }
+                i = j;
+            } else {
+                result += arg[i];
+                i++;
+            }
+        }
+        arg = result;
+    }
+}
 
 // Parser
 std::vector<std::string> parseLine(const std::string& line) {
@@ -58,7 +93,9 @@ std::vector<std::string> parseLine(const std::string& line) {
 }
 
 // Execute a single command (no pipeline)
-void executeSingleCommand(std::vector<std::string>& cleanArgs,const std::string& inputFile,const std::string& outputFile) {
+void executeSingleCommand(std::vector<std::string>& cleanArgs,
+                          const std::string& inputFile,
+                          const std::string& outputFile) {
     std::vector<char*> c_args;
     for (auto &arg : cleanArgs) {
         c_args.push_back(const_cast<char*>(arg.c_str()));
@@ -85,7 +122,8 @@ void executeSingleCommand(std::vector<std::string>& cleanArgs,const std::string&
 
         // Handle output redirection
         if (!outputFile.empty()) {
-            int fd = open(outputFile.c_str(),O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            int fd = open(outputFile.c_str(),
+                          O_WRONLY | O_CREAT | O_TRUNC, 0644);
             if (fd < 0) {
                 perror("Failed to open output file");
                 exit(EXIT_FAILURE);
@@ -105,29 +143,28 @@ void executeSingleCommand(std::vector<std::string>& cleanArgs,const std::string&
     }
 }
 
-void executePipeline(std::vector<std::string>& leftArgs,std::vector<std::string>& rightArgs,const std::string& inputFile,const std::string& outputFile){
-    // Create pipe: pipefd[0] is read end, pipefd[1] is write end
+void executePipeline(std::vector<std::string>& leftArgs,
+                     std::vector<std::string>& rightArgs,
+                     const std::string& inputFile,
+                     const std::string& outputFile){
     int pipefd[2];
     if (pipe(pipefd) < 0) {
         perror("Pipe failed");
         return;
     }
 
-    // Prepare arguments for left command
     std::vector<char*> left_c_args;
     for (auto &arg : leftArgs) {
         left_c_args.push_back(const_cast<char*>(arg.c_str()));
     }
     left_c_args.push_back(nullptr);
 
-    // Prepare arguments for right command
     std::vector<char*> right_c_args;
     for (auto &arg : rightArgs) {
         right_c_args.push_back(const_cast<char*>(arg.c_str()));
     }
     right_c_args.push_back(nullptr);
 
-    // Fork first child for left command (writes to pipe)
     pid_t pid1 = fork();
 
     if (pid1 < 0) {
@@ -136,12 +173,8 @@ void executePipeline(std::vector<std::string>& leftArgs,std::vector<std::string>
         close(pipefd[1]);
         return;
     } else if (pid1 == 0) {
-        // First child: executes left command
-
-        // Close read end (we only write)
         close(pipefd[0]);
 
-        // Handle input file redirection for first command
         if (!inputFile.empty()) {
             int fd = open(inputFile.c_str(), O_RDONLY);
             if (fd < 0) {
@@ -152,7 +185,6 @@ void executePipeline(std::vector<std::string>& leftArgs,std::vector<std::string>
             close(fd);
         }
 
-        // Redirect stdout to pipe write end
         dup2(pipefd[1], STDOUT_FILENO);
         close(pipefd[1]);
 
@@ -162,7 +194,6 @@ void executePipeline(std::vector<std::string>& leftArgs,std::vector<std::string>
         exit(EXIT_FAILURE);
     }
 
-    // Fork second child for right command (reads from pipe)
     pid_t pid2 = fork();
 
     if (pid2 < 0) {
@@ -171,16 +202,11 @@ void executePipeline(std::vector<std::string>& leftArgs,std::vector<std::string>
         close(pipefd[1]);
         return;
     } else if (pid2 == 0) {
-        // Second child: executes right command
-
-        // Close write end (we only read)
         close(pipefd[1]);
 
-        // Redirect stdin to pipe read end
         dup2(pipefd[0], STDIN_FILENO);
         close(pipefd[0]);
 
-        // Handle output file redirection for second command
         if (!outputFile.empty()) {
             int fd = open(outputFile.c_str(),
                           O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -198,38 +224,54 @@ void executePipeline(std::vector<std::string>& leftArgs,std::vector<std::string>
         exit(EXIT_FAILURE);
     }
 
-    // Parent process: close both ends and wait for children
     close(pipefd[0]);
     close(pipefd[1]);
 
     int status;
     waitpid(pid1, &status, 0);
     waitpid(pid2, &status, 0);
-
 }
 
 int main() {
     std::string inputLine;
+    std::vector<std::string> history;   // NEW: command history
 
     while (true) {
         std::cout << "Mini-shell> " << std::flush;
 
-        if (!std::getline(std::cin, inputLine)) { // read input
+        if (!std::getline(std::cin, inputLine)) {
             std::cout << "\n";
             break;
         }
 
         if (inputLine.empty()) continue;
 
+        // NEW: handle !! (repeat last command)
+        if (inputLine == "!!") {
+            if (history.empty()) {
+                std::cerr << "No commands in history\n";
+                continue;
+            }
+            inputLine = history.back();
+            std::cout << inputLine << "\n";
+        }
+
+        // store *expanded* command line in history
+        history.push_back(inputLine);
+
         // parse input
         std::vector<std::string> args = parseLine(inputLine);
         if (args.empty()) continue;
 
+        // expand $VAR
+        expandEnvironment(args);
+        if (args.empty()) continue;
+
         if (args[0] == "exit") break;
 
-        if (args[0] == "cd") {   // for cd
+        // cd builtin
+        if (args[0] == "cd") {
             if (args.size() < 2) {
-                // No argument - go to HOME directory
                 const char* home = getenv("HOME");
                 if (home != nullptr) {
                     chdir(home);
@@ -242,18 +284,56 @@ int main() {
             continue;
         }
 
-        // Check if there's a pipeline operator
+        // NEW: history builtin
+        if (args[0] == "history") {
+            for (size_t i = 0; i < history.size(); ++i) {
+                std::cout << i + 1 << "  " << history[i] << "\n";
+            }
+            continue;
+        }
+
+        // NEW: env builtin
+        if (args[0] == "env") {
+            for (char **e = environ; *e != nullptr; ++e) {
+                std::cout << *e << "\n";
+            }
+            continue;
+        }
+
+        // NEW: setenv VAR VALUE
+        if (args[0] == "setenv") {
+            if (args.size() < 3) {
+                std::cerr << "Usage: setenv VAR VALUE\n";
+            } else {
+                if (setenv(args[1].c_str(), args[2].c_str(), 1) != 0) {
+                    perror("setenv");
+                }
+            }
+            continue;
+        }
+
+        // NEW: unsetenv VAR
+        if (args[0] == "unsetenv") {
+            if (args.size() < 2) {
+                std::cerr << "Usage: unsetenv VAR\n";
+            } else {
+                if (unsetenv(args[1].c_str()) != 0) {
+                    perror("unsetenv");
+                }
+            }
+            continue;
+        }
+
+        // Check for pipeline operator
         int pipePosition = -1;
         for (size_t i = 0; i < args.size(); i++) {
             if (args[i] == "|") {
-                pipePosition = i;
+                pipePosition = static_cast<int>(i);
                 break;
             }
         }
 
-        // If pipeline exists, split into left and right parts
         if (pipePosition != -1) {
-            // Extract left side (before |)
             std::vector<std::string> leftSide;
             std::string inputFile;
             bool syntaxError = false;
@@ -273,7 +353,6 @@ int main() {
                 }
             }
 
-            // Extract right side (after |)
             std::vector<std::string> rightSide;
             std::string outputFile;
 
@@ -292,7 +371,6 @@ int main() {
                 }
             }
 
-            // Check for errors
             if (syntaxError) {
                 continue;
             }
@@ -307,11 +385,9 @@ int main() {
                 continue;
             }
 
-            // Execute pipeline
             executePipeline(leftSide, rightSide, inputFile, outputFile);
         }
         else {
-            // No pipeline - single command execution
             std::string inputFile;
             std::string outputFile;
             std::vector<std::string> cleanArgs;
@@ -341,14 +417,13 @@ int main() {
                 }
             }
 
-            // Skip execution if syntax error or no command
             if (syntaxError || cleanArgs.empty()) {
                 continue;
             }
 
-            // Execute single command
             executeSingleCommand(cleanArgs, inputFile, outputFile);
         }
     }
     return 0;
 }
+
