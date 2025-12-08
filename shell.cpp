@@ -1,3 +1,5 @@
+
+
 #include <iostream>
 #include <string>
 #include <vector>
@@ -12,17 +14,20 @@
 
 extern char **environ; // for env builtin
 
-// Function declaration
+// Function declarations
 std::vector<std::string> parseLine(const std::string& line);
 void executeSingleCommand(std::vector<std::string>& cleanArgs,
                           const std::string& inputFile,
-                          const std::string& outputFile);
-void executePipeline(std::vector<std::string>& leftArgs,
-                     std::vector<std::string>& rightArgs,
-                     const std::string& inputFile,
-                     const std::string& outputFile);
+                          const std::string& outputFile,
+                          bool append,
+                          bool background);
+void executePipelineChain(std::vector<std::vector<std::string>>& commands,
+                          const std::string& inputFile,
+                          const std::string& outputFile,
+                          bool append,
+                          bool background);
 
-// --- NEW: expand $VAR in arguments ---
+// --- expand $VAR in arguments ---
 void expandEnvironment(std::vector<std::string>& args) {
     for (auto &arg : args) {
         std::string result;
@@ -79,7 +84,6 @@ std::vector<std::string> parseLine(const std::string& line) {
         }
     }
 
-    // Check for unclosed quotes
     if (insideQuotes) {
         std::cerr << "Error: Unclosed quote\n";
         return std::vector<std::string>();
@@ -95,7 +99,9 @@ std::vector<std::string> parseLine(const std::string& line) {
 // Execute a single command (no pipeline)
 void executeSingleCommand(std::vector<std::string>& cleanArgs,
                           const std::string& inputFile,
-                          const std::string& outputFile) {
+                          const std::string& outputFile,
+                          bool append,
+                          bool background) {
     std::vector<char*> c_args;
     for (auto &arg : cleanArgs) {
         c_args.push_back(const_cast<char*>(arg.c_str()));
@@ -109,7 +115,7 @@ void executeSingleCommand(std::vector<std::string>& cleanArgs,
         return;
     } else if (pid == 0) { // child
 
-        // Handle input redirection
+        // input redirection
         if (!inputFile.empty()) {
             int fd = open(inputFile.c_str(), O_RDONLY);
             if (fd < 0) {
@@ -120,10 +126,15 @@ void executeSingleCommand(std::vector<std::string>& cleanArgs,
             close(fd);
         }
 
-        // Handle output redirection
+        // output redirection (truncate vs append)
         if (!outputFile.empty()) {
-            int fd = open(outputFile.c_str(),
-                          O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            int flags = O_WRONLY | O_CREAT;
+            if (append) {
+                flags |= O_APPEND;
+            } else {
+                flags |= O_TRUNC;
+            }
+            int fd = open(outputFile.c_str(), flags, 0644);
             if (fd < 0) {
                 perror("Failed to open output file");
                 exit(EXIT_FAILURE);
@@ -138,103 +149,131 @@ void executeSingleCommand(std::vector<std::string>& cleanArgs,
                   << cleanArgs[0] << "\n";
         exit(EXIT_FAILURE);
     } else { // parent process
-        int status;
-        waitpid(pid, &status, 0);
+        if (!background) {
+            int status;
+            waitpid(pid, &status, 0);
+        } else {
+            std::cout << "[bg pid " << pid << "]\n";
+        }
     }
 }
 
-void executePipeline(std::vector<std::string>& leftArgs,
-                     std::vector<std::string>& rightArgs,
-                     const std::string& inputFile,
-                     const std::string& outputFile){
-    int pipefd[2];
-    if (pipe(pipefd) < 0) {
-        perror("Pipe failed");
-        return;
-    }
+// Execute chain: cmd1 | cmd2 | ... | cmdN  (+ optional redirection and bg)
+void executePipelineChain(std::vector<std::vector<std::string>>& commands,
+                          const std::string& inputFile,
+                          const std::string& outputFile,
+                          bool append,
+                          bool background) {
+    int n = commands.size();
+    if (n == 0) return;
 
-    std::vector<char*> left_c_args;
-    for (auto &arg : leftArgs) {
-        left_c_args.push_back(const_cast<char*>(arg.c_str()));
-    }
-    left_c_args.push_back(nullptr);
+    std::vector<pid_t> pids;
+    pids.reserve(n);
 
-    std::vector<char*> right_c_args;
-    for (auto &arg : rightArgs) {
-        right_c_args.push_back(const_cast<char*>(arg.c_str()));
-    }
-    right_c_args.push_back(nullptr);
+    int prev_read_fd = -1;
 
-    pid_t pid1 = fork();
-
-    if (pid1 < 0) {
-        perror("Fork failed");
-        close(pipefd[0]);
-        close(pipefd[1]);
-        return;
-    } else if (pid1 == 0) {
-        close(pipefd[0]);
-
-        if (!inputFile.empty()) {
-            int fd = open(inputFile.c_str(), O_RDONLY);
-            if (fd < 0) {
-                perror("Failed to open input file");
-                exit(EXIT_FAILURE);
+    for (int k = 0; k < n; ++k) {
+        int pipefd[2] = {-1, -1};
+        if (k < n - 1) {
+            if (pipe(pipefd) < 0) {
+                perror("pipe");
+                return;
             }
-            dup2(fd, STDIN_FILENO);
-            close(fd);
         }
 
-        dup2(pipefd[1], STDOUT_FILENO);
-        close(pipefd[1]);
-
-        execvp(left_c_args[0], left_c_args.data());
-
-        std::cerr << "Error: Command not found: " << leftArgs[0] << "\n";
-        exit(EXIT_FAILURE);
-    }
-
-    pid_t pid2 = fork();
-
-    if (pid2 < 0) {
-        perror("Fork failed");
-        close(pipefd[0]);
-        close(pipefd[1]);
-        return;
-    } else if (pid2 == 0) {
-        close(pipefd[1]);
-
-        dup2(pipefd[0], STDIN_FILENO);
-        close(pipefd[0]);
-
-        if (!outputFile.empty()) {
-            int fd = open(outputFile.c_str(),
-                          O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (fd < 0) {
-                perror("Failed to open output file");
-                exit(EXIT_FAILURE);
-            }
-            dup2(fd, STDOUT_FILENO);
-            close(fd);
+        std::vector<char*> c_args;
+        for (auto &arg : commands[k]) {
+            c_args.push_back(const_cast<char*>(arg.c_str()));
         }
+        c_args.push_back(nullptr);
 
-        execvp(right_c_args[0], right_c_args.data());
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("fork");
+            if (pipefd[0] != -1) close(pipefd[0]);
+            if (pipefd[1] != -1) close(pipefd[1]);
+            return;
+        } else if (pid == 0) {
+            // child
 
-        std::cerr << "Error: Command not found: " << rightArgs[0] << "\n";
-        exit(EXIT_FAILURE);
+            // if not first command: stdin from prev_read_fd
+            if (k > 0) {
+                dup2(prev_read_fd, STDIN_FILENO);
+            }
+
+            // if not last command: stdout to pipe write end
+            if (k < n - 1) {
+                dup2(pipefd[1], STDOUT_FILENO);
+            }
+
+            // close unused fds in child
+            if (prev_read_fd != -1) close(prev_read_fd);
+            if (pipefd[0] != -1) close(pipefd[0]);
+            if (pipefd[1] != -1) close(pipefd[1]);
+
+            // first command: possible input redirection
+            if (k == 0 && !inputFile.empty()) {
+                int fd = open(inputFile.c_str(), O_RDONLY);
+                if (fd < 0) {
+                    perror("Failed to open input file");
+                    exit(EXIT_FAILURE);
+                }
+                dup2(fd, STDIN_FILENO);
+                close(fd);
+            }
+
+            // last command: possible output redirection
+            if (k == n - 1 && !outputFile.empty()) {
+                int flags = O_WRONLY | O_CREAT;
+                if (append) {
+                    flags |= O_APPEND;
+                } else {
+                    flags |= O_TRUNC;
+                }
+                int fd = open(outputFile.c_str(), flags, 0644);
+                if (fd < 0) {
+                    perror("Failed to open output file");
+                    exit(EXIT_FAILURE);
+                }
+                dup2(fd, STDOUT_FILENO);
+                close(fd);
+            }
+
+            execvp(c_args[0], c_args.data());
+            std::cerr << "Error: Command not found: "
+                      << commands[k][0] << "\n";
+            exit(EXIT_FAILURE);
+        } else {
+            // parent
+            pids.push_back(pid);
+
+            // close old read end
+            if (prev_read_fd != -1) close(prev_read_fd);
+
+            // close write end in parent, keep read end for next command
+            if (pipefd[1] != -1) close(pipefd[1]);
+            prev_read_fd = pipefd[0];
+        }
     }
 
-    close(pipefd[0]);
-    close(pipefd[1]);
+    // close last read end in parent
+    if (prev_read_fd != -1) close(prev_read_fd);
 
-    int status;
-    waitpid(pid1, &status, 0);
-    waitpid(pid2, &status, 0);
+    if (!background) {
+        for (pid_t p : pids) {
+            int status;
+            waitpid(p, &status, 0);
+        }
+    } else {
+        std::cout << "[bg pids";
+        for (pid_t p : pids) std::cout << " " << p;
+        std::cout << " ]\n";
+    }
 }
 
 int main() {
     std::string inputLine;
-    std::vector<std::string> history;   // NEW: command history
+    std::vector<std::string> history;   // command history
 
     while (true) {
         std::cout << "Mini-shell> " << std::flush;
@@ -246,7 +285,7 @@ int main() {
 
         if (inputLine.empty()) continue;
 
-        // NEW: handle !! (repeat last command)
+        // !! (repeat last command)
         if (inputLine == "!!") {
             if (history.empty()) {
                 std::cerr << "No commands in history\n";
@@ -256,7 +295,7 @@ int main() {
             std::cout << inputLine << "\n";
         }
 
-        // store *expanded* command line in history
+        // store in history
         history.push_back(inputLine);
 
         // parse input
@@ -266,6 +305,17 @@ int main() {
         // expand $VAR
         expandEnvironment(args);
         if (args.empty()) continue;
+
+        // background? (trailing &)
+        bool background = false;
+        if (!args.empty() && args.back() == "&") {
+            background = true;
+            args.pop_back();
+            if (args.empty()) {
+                std::cerr << "Syntax error: '&' with no command\n";
+                continue;
+            }
+        }
 
         if (args[0] == "exit") break;
 
@@ -284,7 +334,7 @@ int main() {
             continue;
         }
 
-        // NEW: history builtin
+        // history builtin
         if (args[0] == "history") {
             for (size_t i = 0; i < history.size(); ++i) {
                 std::cout << i + 1 << "  " << history[i] << "\n";
@@ -292,7 +342,7 @@ int main() {
             continue;
         }
 
-        // NEW: env builtin
+        // env builtin
         if (args[0] == "env") {
             for (char **e = environ; *e != nullptr; ++e) {
                 std::cout << *e << "\n";
@@ -300,7 +350,7 @@ int main() {
             continue;
         }
 
-        // NEW: setenv VAR VALUE
+        // setenv VAR VALUE
         if (args[0] == "setenv") {
             if (args.size() < 3) {
                 std::cerr << "Usage: setenv VAR VALUE\n";
@@ -312,7 +362,7 @@ int main() {
             continue;
         }
 
-        // NEW: unsetenv VAR
+        // unsetenv VAR
         if (args[0] == "unsetenv") {
             if (args.size() < 2) {
                 std::cerr << "Usage: unsetenv VAR\n";
@@ -324,88 +374,104 @@ int main() {
             continue;
         }
 
-        // Check for pipeline operator
-        int pipePosition = -1;
-        for (size_t i = 0; i < args.size(); i++) {
-            if (args[i] == "|") {
-                pipePosition = static_cast<int>(i);
-                break;
-            }
+        // --- pipeline + redirection parsing (supports multiple pipes) ---
+
+        // find pipe positions
+        std::vector<size_t> pipePositions;
+        for (size_t i = 0; i < args.size(); ++i) {
+            if (args[i] == "|") pipePositions.push_back(i);
         }
 
-        if (pipePosition != -1) {
-            std::vector<std::string> leftSide;
-            std::string inputFile;
-            bool syntaxError = false;
+        std::string inputFile;
+        std::string outputFile;
+        bool append = false;
+        bool syntaxError = false;
 
-            for (int i = 0; i < pipePosition; i++) {
-                if (args[i] == "<") {
-                    if (i + 1 < pipePosition) {
-                        inputFile = args[i + 1];
-                        i++;
+        if (!pipePositions.empty()) {
+            // multiple commands in pipeline
+            std::vector<std::vector<std::string>> commands;
+
+            size_t start = 0;
+            int numCmds = pipePositions.size() + 1;
+
+            for (int cmdIndex = 0; cmdIndex < numCmds; ++cmdIndex) {
+                size_t end = (cmdIndex < (int)pipePositions.size())
+                             ? pipePositions[cmdIndex]
+                             : args.size();
+
+                std::vector<std::string> cmd;
+                for (size_t i = start; i < end; ++i) {
+                    const std::string& tok = args[i];
+
+                    if (tok == "<") {
+                        if (cmdIndex != 0) {
+                            std::cerr << "Syntax error: input redirection only allowed in first command of pipeline\n";
+                            syntaxError = true;
+                            break;
+                        }
+                        if (i + 1 < end) {
+                            inputFile = args[i + 1];
+                            ++i;
+                        } else {
+                            std::cerr << "Syntax error: no input file specified\n";
+                            syntaxError = true;
+                            break;
+                        }
+                    } else if (tok == ">" || tok == ">>") {
+                        if (cmdIndex != numCmds - 1) {
+                            std::cerr << "Syntax error: output redirection only allowed in last command of pipeline\n";
+                            syntaxError = true;
+                            break;
+                        }
+                        if (i + 1 < end) {
+                            outputFile = args[i + 1];
+                            append = (tok == ">>");
+                            ++i;
+                        } else {
+                            std::cerr << "Syntax error: no output file specified\n";
+                            syntaxError = true;
+                            break;
+                        }
                     } else {
-                        std::cerr << "Syntax error: no input file specified\n";
-                        syntaxError = true;
-                        break;
+                        cmd.push_back(tok);
                     }
-                } else {
-                    leftSide.push_back(args[i]);
                 }
-            }
 
-            std::vector<std::string> rightSide;
-            std::string outputFile;
-
-            for (size_t i = pipePosition + 1; i < args.size(); i++) {
-                if (args[i] == ">") {
-                    if (i + 1 < args.size()) {
-                        outputFile = args[i + 1];
-                        i++;
-                    } else {
-                        std::cerr << "Syntax error: no output file specified\n";
-                        syntaxError = true;
-                        break;
-                    }
-                } else {
-                    rightSide.push_back(args[i]);
+                if (syntaxError) break;
+                if (cmd.empty()) {
+                    std::cerr << "Syntax error: empty command in pipeline\n";
+                    syntaxError = true;
+                    break;
                 }
+
+                commands.push_back(cmd);
+                start = end + 1; // skip '|'
             }
 
-            if (syntaxError) {
-                continue;
-            }
+            if (syntaxError) continue;
 
-            if (leftSide.empty()) {
-                std::cerr << "Syntax error: no command before |\n";
-                continue;
-            }
-
-            if (rightSide.empty()) {
-                std::cerr << "Syntax error: no command after |\n";
-                continue;
-            }
-
-            executePipeline(leftSide, rightSide, inputFile, outputFile);
+            executePipelineChain(commands, inputFile, outputFile, append, background);
         }
         else {
-            std::string inputFile;
-            std::string outputFile;
+            // single command (no pipes)
+            std::string inFile;
+            std::string outFile;
             std::vector<std::string> cleanArgs;
-            bool syntaxError = false;
 
             for (size_t i = 0; i < args.size(); i++) {
                 if (args[i] == "<") {
                     if (i + 1 < args.size()) {
-                        inputFile = args[i + 1];
+                        inFile = args[i + 1];
                         i++;
                     } else {
                         std::cerr << "Syntax error: no input file specified\n";
                         syntaxError = true;
                         break;
                     }
-                } else if (args[i] == ">") {
+                } else if (args[i] == ">" || args[i] == ">>") {
                     if (i + 1 < args.size()) {
-                        outputFile = args[i + 1];
+                        outFile = args[i + 1];
+                        append = (args[i] == ">>");
                         i++;
                     } else {
                         std::cerr << "Syntax error: no output file specified\n";
@@ -421,9 +487,8 @@ int main() {
                 continue;
             }
 
-            executeSingleCommand(cleanArgs, inputFile, outputFile);
+            executeSingleCommand(cleanArgs, inFile, outFile, append, background);
         }
     }
     return 0;
 }
-
