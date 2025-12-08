@@ -7,3 +7,7 @@ Step3. I/O redirection (<, >)
 Step4. Single pipeline support (cmd1 | cmd2)
 
 Step5. Background execution (&)
+
+Step6. History keyword
+
+Step7. Report
