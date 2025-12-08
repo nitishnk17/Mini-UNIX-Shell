@@ -8,13 +8,23 @@
 #include <fcntl.h>
 #include <cerrno>
 #include <cstdlib>
+#include <signal.h>
 
-// Function declaration
+// Signal handler for cleaning up zombie background processes
+void signalHandler(int signo) {
+    (void)signo;  // Unused parameter
+    // Reap all terminated child processes without blocking
+    while (waitpid(-1, NULL, WNOHANG) > 0) {
+        // Keep reaping until no more zombies
+    }
+}
+
+// Function declarations
 std::vector<std::string> parseLine(const std::string& line);
-void executeSingleCommand(std::vector<std::string>& cleanArgs,const std::string& inputFile,const std::string& outputFile);
-void executePipeline(std::vector<std::string>& leftArgs,std::vector<std::string>& rightArgs,const std::string& inputFile,const std::string& outputFile);
+void executeSingleCommand(std::vector<std::string>& cleanArgs,const std::string& inputFile,const std::string& outputFile,bool background);
+void executePipeline(std::vector<std::string>& leftArgs,std::vector<std::string>& rightArgs,const std::string& inputFile,const std::string& outputFile,bool background);
 
-// Parser
+// Parse input line and handle quoted strings
 std::vector<std::string> parseLine(const std::string& line) {
     std::vector<std::string> args;
     std::string currentWord = "";
@@ -32,7 +42,6 @@ std::vector<std::string> parseLine(const std::string& line) {
             insideQuotes = false;
             quoteChar = '\0';
         }
-        // If space or tab and not inside quotes
         else if ((ch == ' ' || ch == '\t') && !insideQuotes) {
             if (!currentWord.empty()) {
                 args.push_back(currentWord);
@@ -44,12 +53,13 @@ std::vector<std::string> parseLine(const std::string& line) {
         }
     }
 
-    // Check for unclosed quotes
+    // for unclosed quotes
     if (insideQuotes) {
         std::cerr << "Error: Unclosed quote\n";
-        return std::vector<std::string>();
+        return std::vector<std::string>(); 
     }
 
+    // Add last word
     if (!currentWord.empty()) {
         args.push_back(currentWord);
     }
@@ -58,7 +68,7 @@ std::vector<std::string> parseLine(const std::string& line) {
 }
 
 // Execute a single command (no pipeline)
-void executeSingleCommand(std::vector<std::string>& cleanArgs,const std::string& inputFile,const std::string& outputFile) {
+void executeSingleCommand(std::vector<std::string>& cleanArgs, const std::string& inputFile, const std::string& outputFile, bool background) {
     std::vector<char*> c_args;
     for (auto &arg : cleanArgs) {
         c_args.push_back(const_cast<char*>(arg.c_str()));
@@ -70,9 +80,9 @@ void executeSingleCommand(std::vector<std::string>& cleanArgs,const std::string&
     if (pid < 0) {
         std::cerr << "Fork failed\n";
         return;
-    } else if (pid == 0) { // child
+    } else if (pid == 0) {
 
-        // Handle input redirection
+        // Handle input 
         if (!inputFile.empty()) {
             int fd = open(inputFile.c_str(), O_RDONLY);
             if (fd < 0) {
@@ -85,7 +95,7 @@ void executeSingleCommand(std::vector<std::string>& cleanArgs,const std::string&
 
         // Handle output redirection
         if (!outputFile.empty()) {
-            int fd = open(outputFile.c_str(),O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            int fd = open(outputFile.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
             if (fd < 0) {
                 perror("Failed to open output file");
                 exit(EXIT_FAILURE);
@@ -96,20 +106,134 @@ void executeSingleCommand(std::vector<std::string>& cleanArgs,const std::string&
 
         execvp(c_args[0], c_args.data());
 
-        std::cerr << "Error: Command not found: "
-                  << cleanArgs[0] << "\n";
+        std::cerr << "Error: Command not found: " << cleanArgs[0] << "\n";
         exit(EXIT_FAILURE);
     } else { // parent process
-        int status;
-        waitpid(pid, &status, 0);
+        if (background) {
+            // Background process - do not wait
+            std::cout << "[Background] PID: " << pid << "\n";
+        } else {
+            // Foreground process - wait for completion
+            int status;
+            waitpid(pid, &status, 0);
+        }
     }
 }
 
-void executePipeline(std::vector<std::string>& leftArgs,std::vector<std::string>& rightArgs,const std::string& inputFile,const std::string& outputFile){
+// Execute pipeline: cmd1 | cmd2
+void executePipeline(std::vector<std::string>& leftArgs, std::vector<std::string>& rightArgs, const std::string& inputFile, const std::string& outputFile, bool background) {
 
+    // Create pipe: pipefd[0] is read end, pipefd[1] is write end
+    int pipefd[2];
+    if (pipe(pipefd) < 0) {
+        perror("Pipe failed");
+        return;
+    }
+
+    // Prepare arguments for left command
+    std::vector<char*> left_c_args;
+    for (auto &arg : leftArgs) {
+        left_c_args.push_back(const_cast<char*>(arg.c_str()));
+    }
+    left_c_args.push_back(nullptr);
+
+    // Prepare arguments for right command
+    std::vector<char*> right_c_args;
+    for (auto &arg : rightArgs) {
+        right_c_args.push_back(const_cast<char*>(arg.c_str()));
+    }
+    right_c_args.push_back(nullptr);
+
+    // Fork first child for left command (writes to pipe)
+    pid_t pid1 = fork();
+
+    if (pid1 < 0) {
+        perror("Fork failed");
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return;
+    } else if (pid1 == 0) {
+        // First child: executes left command
+
+        // Close read end (we only write)
+        close(pipefd[0]);
+
+        // Handle input file redirection for first command
+        if (!inputFile.empty()) {
+            int fd = open(inputFile.c_str(), O_RDONLY);
+            if (fd < 0) {
+                perror("Failed to open input file");
+                exit(EXIT_FAILURE);
+            }
+            dup2(fd, STDIN_FILENO);
+            close(fd);
+        }
+
+        // Redirect stdout to pipe write end
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[1]);
+
+        execvp(left_c_args[0], left_c_args.data());
+
+        std::cerr << "Error: Command not found: " << leftArgs[0] << "\n";
+        exit(EXIT_FAILURE);
+    }
+
+    // Fork second child for right command (reads from pipe)
+    pid_t pid2 = fork();
+
+    if (pid2 < 0) {
+        perror("Fork failed");
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return;
+    } else if (pid2 == 0) {
+        // Second child: executes right command
+
+        // Close write end (we only read)
+        close(pipefd[1]);
+
+        // Redirect stdin to pipe read end
+        dup2(pipefd[0], STDIN_FILENO);
+        close(pipefd[0]);
+
+        // Handle output file redirection for second command
+        if (!outputFile.empty()) {
+            int fd = open(outputFile.c_str(),
+                          O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd < 0) {
+                perror("Failed to open output file");
+                exit(EXIT_FAILURE);
+            }
+            dup2(fd, STDOUT_FILENO);
+            close(fd);
+        }
+
+        execvp(right_c_args[0], right_c_args.data());
+
+        std::cerr << "Error: Command not found: " << rightArgs[0] << "\n";
+        exit(EXIT_FAILURE);
+    }
+
+    // Parent process: close both ends and wait for children
+    close(pipefd[0]);
+    close(pipefd[1]);
+
+    if (background) {
+        // Background execution - don't wait
+        std::cout << "[Background] PIDs: " << pid1 << ", " << pid2 << "\n";
+    } else {
+        // Foreground execution - wait for both
+        int status;
+        waitpid(pid1, &status, 0);
+        waitpid(pid2, &status, 0);
+    }
 }
 
 int main() {
+    // Setup signal handler for zombie process cleanup
+    signal(SIGCHLD, signalHandler);
+
     std::string inputLine;
 
     while (true) {
@@ -141,6 +265,17 @@ int main() {
                 }
             }
             continue;
+        }
+
+        // Check for background execution (&)
+        bool background = false;
+        if (args.back() == "&") {
+            background = true;
+            args.pop_back();  // Remove & from args
+            if (args.empty()) {
+                std::cerr << "Error: No command specified\n";
+                continue;
+            }
         }
 
         // Check if there's a pipeline operator
@@ -209,7 +344,7 @@ int main() {
             }
 
             // Execute pipeline
-            executePipeline(leftSide, rightSide, inputFile, outputFile);
+            executePipeline(leftSide, rightSide, inputFile, outputFile, background);
         }
         else {
             // No pipeline - single command execution
@@ -248,7 +383,7 @@ int main() {
             }
 
             // Execute single command
-            executeSingleCommand(cleanArgs, inputFile, outputFile);
+            executeSingleCommand(cleanArgs, inputFile, outputFile, background);
         }
     }
     return 0;
