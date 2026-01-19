@@ -1,6 +1,6 @@
 # Mini UNIX Shell
 
-Our implementation of a command-line shell in C++ for the COD7001 Cornerstone Lab. This project provided hands-on experience with fundamental UNIX concepts: process creation and management, file descriptor manipulation, inter-process communication via pipes, and signal handling. Building this shell from scratch helped us understand how terminal programs like bash work internally.
+Our implementation of a command-line shell in C++. This project provided hands-on experience with fundamental UNIX concepts: process creation and management, file descriptor manipulation, inter-process communication via pipes, and signal handling. Building this shell from scratch helped us understand how terminal programs like bash work internally.
 
 ## What We Built
 
